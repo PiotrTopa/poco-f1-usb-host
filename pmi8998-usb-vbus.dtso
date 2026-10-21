@@ -1,0 +1,38 @@
+// PMI8998 USB-OTG VBUS boost regulator - Xiaomi POCO F1 (beryllium, SDM845).
+//
+// Makes the phone source its own 5 V VBUS on the USB-C port when the dwc3
+// controller runs as a USB host (dr_mode = "host", see ./poco-usb).
+//
+// WHAT THIS IS:
+//   The PMI8998 has a USB-OTG boost converter at SPMI offset 0x1100 whose register
+//   layout is identical to the PM8150B (CMD_OTG @ +0x40 / OTG_EN bit0, current-limit
+//   @ +0x52, OTG_CFG @ +0x53). The in-tree generic `qcom_usb_vbus-regulator` driver
+//   is chip-agnostic - it only reads `reg`/`compatible` from the device tree and has
+//   no chip-specific data - so giving it this node with the pm8150b-vbus-reg
+//   compatible makes it drive the PMI8998 boost UNCHANGED. With `regulator-always-on`
+//   the regulator core writes OTG_EN at boot and the phone sources 5 V continuously.
+//   No kernel rebuild and no role-switch / TCPM driver are needed: the dwc3 role is
+//   fixed to `host` via dr_mode.
+//
+// HOW IT IS APPLIED:
+//   postmarketOS on beryllium boots an appended DTB (deviceinfo_append_dtb=true),
+//   /boot/dtbs/qcom/sdm845-xiaomi-beryllium-{tianma,ebbg}.dtb depending on the panel.
+//   This file is NOT loaded as a runtime overlay; `poco-vbus apply` decompiles the
+//   DTB, inserts the node below verbatim inside the pmic@2 (PMI8998) SPMI node -
+//   which has #address-cells=1 / #size-cells=0, so a single-cell `reg` is correct -
+//   just before charger@1000, recompiles, then `mkinitfs` repacks and flashes
+//   boot.img. Re-run after every kernel update (it reinstalls a pristine DTB).
+//
+// Device-tree path of the parent node: /soc@0/spmi@c440000/pmic@2
+//
+// VERIFIED (2026-06-05): pendrive enumerated at high speed, 4 MB read @ 13.4 MB/s,
+// no over-current, regulator state=enabled.
+
+usb_vbus: usb-vbus-regulator@1100 {
+	compatible = "qcom,pm8150b-vbus-reg";
+	reg = <0x1100>;
+	regulator-min-microamp = <500000>;
+	regulator-max-microamp = <3000000>;
+	regulator-always-on;
+	regulator-boot-on;
+};

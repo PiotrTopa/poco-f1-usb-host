@@ -1,0 +1,196 @@
+#!/bin/sh
+# poco-vbus - make a Xiaomi POCO F1 (beryllium) on postmarketOS source its own
+# 5 V VBUS on the USB-C port as a USB host.
+#
+# WHY: the PMI8998 has a USB-OTG boost converter at SPMI offset 0x1100 whose
+# register layout is identical to the PM8150B. The in-tree generic
+# `qcom_usb_vbus-regulator` driver is chip-agnostic (it only reads reg/compatible
+# from the device tree), so adding a regulator node under pmic@2 with the
+# pm8150b-vbus-reg compatible makes that driver enable the boost at boot. With
+# `regulator-always-on` the phone permanently sources 5 V on its USB-C port, so a
+# directly plugged device enumerates with NO external power / Y-cable. No kernel
+# rebuild and no role-switch driver are required (the role is fixed to `host`
+# via the dwc3 dr_mode - see poco-usb).
+#
+# This patches the DTB by decompile -> insert node -> recompile, then mkinitfs
+# (repack + flash boot.img). It is IDEMPOTENT: a no-op if the node already exists.
+# Re-run it after a linux-postmarketos-qcom-sdm845 update (which reinstalls a
+# pristine DTB and drops this node). Pair with `poco-usb host`.
+#
+#   poco-vbus apply  [--reboot]   add the node if missing (default action)
+#   poco-vbus status              show node + regulator + live VBUS state
+#   poco-vbus revert [--reboot]   remove the node again
+#
+# The DTB is auto-detected (Tianma/EBBG); override with POCO_DTB=/path/to.dtb.
+# Backups of boot.img + DTB go to /root/boot-backup/vbus-<timestamp>/.
+set -u
+
+# --- DTB auto-detection (shared by poco-usb and poco-vbus) -------------------
+# The POCO F1 ships with either a Tianma or an EBBG panel; postmarketOS boots
+# the matching appended DTB. Resolution order:
+#   1. $POCO_DTB if set (explicit override, full path)
+#   2. /proc/device-tree/model  ("... (Tianma)" / "... (EBBG)")
+#   3. deviceinfo_dtb in /usr/share/deviceinfo/deviceinfo or /etc/deviceinfo,
+#      if it names exactly one variant
+#   4. whichever of the two DTB files exists, if only one does
+DTB_DIR=/boot/dtbs/qcom
+DTB_BASE=sdm845-xiaomi-beryllium
+
+detect_dtb() {
+    if [ -n "${POCO_DTB:-}" ]; then echo "$POCO_DTB"; return 0; fi
+    model=$(tr -d '\0' < /proc/device-tree/model 2>/dev/null | tr 'A-Z' 'a-z')
+    case "$model" in
+        *tianma*) echo "$DTB_DIR/$DTB_BASE-tianma.dtb"; return 0 ;;
+        *ebbg*)   echo "$DTB_DIR/$DTB_BASE-ebbg.dtb";   return 0 ;;
+    esac
+    for f in /usr/share/deviceinfo/deviceinfo /etc/deviceinfo; do
+        [ -r "$f" ] || continue
+        di=$(sed -n 's/^deviceinfo_dtb="\(.*\)"/\1/p' "$f" | tr 'A-Z' 'a-z')
+        case "$di" in
+            *tianma*ebbg*|*ebbg*tianma*) ;;
+            *tianma*) echo "$DTB_DIR/$DTB_BASE-tianma.dtb"; return 0 ;;
+            *ebbg*)   echo "$DTB_DIR/$DTB_BASE-ebbg.dtb";   return 0 ;;
+        esac
+    done
+    found=""; n=0
+    for v in tianma ebbg; do
+        [ -f "$DTB_DIR/$DTB_BASE-$v.dtb" ] && { found="$DTB_DIR/$DTB_BASE-$v.dtb"; n=$((n+1)); }
+    done
+    [ "$n" -eq 1 ] && { echo "$found"; return 0; }
+    return 1
+}
+
+DTB=$(detect_dtb) || {
+    echo "ERROR: cannot determine the active DTB (Tianma vs EBBG)." >&2
+    echo "       Set it explicitly, e.g.:  POCO_DTB=$DTB_DIR/$DTB_BASE-tianma.dtb $0 ..." >&2
+    exit 1
+}
+[ -f "$DTB" ] || { echo "ERROR: DTB not found: $DTB" >&2; exit 1; }
+
+do_reboot() {
+    sync
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        systemctl --no-block reboot
+    else
+        reboot
+    fi
+}
+# -----------------------------------------------------------------------------
+
+PMIC_PATH=/proc/device-tree/soc@0/spmi@c440000/pmic@2
+NODE_NAME="usb-vbus-regulator@1100"
+BK_BASE=/root/boot-backup
+TMP=""
+
+cleanup() { [ -n "$TMP" ] && rm -rf "$TMP"; }
+trap cleanup EXIT INT TERM
+
+need_tools() {
+    for t in dtc mkinitfs; do
+        command -v "$t" >/dev/null 2>&1 || { echo "ERROR: $t missing (apk add dtc)" >&2; exit 1; }
+    done
+    [ "$(id -u)" -eq 0 ] || { echo "ERROR: run as root (sudo)" >&2; exit 1; }
+    TMP=$(mktemp -d)
+}
+
+node_in_dtb() { dtc -I dtb -O dts "$DTB" 2>/dev/null | grep -q "$NODE_NAME"; }
+node_live()   { [ -e "$PMIC_PATH/$NODE_NAME" ]; }
+
+backup() {
+    bk="$BK_BASE/vbus-$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$bk"
+    [ -f /boot/boot.img ] && cp -a /boot/boot.img "$bk/boot.img.pre-vbus"
+    cp -a "$DTB" "$bk/$(basename "$DTB").pre-vbus"
+    echo "backup: $bk"
+}
+
+flash() { # $1 = --reboot?
+    echo "rebuilding + flashing boot.img ..."
+    mkinitfs >/dev/null 2>&1 || mkinitfs || { echo "ERROR: mkinitfs failed" >&2; exit 1; }
+    if [ "${1:-}" = "--reboot" ]; then
+        echo "rebooting to apply (regulator enables on next boot)..."
+        do_reboot
+    else
+        echo "NOTE: reboot required to apply:  sudo reboot  (or re-run with --reboot)"
+    fi
+}
+
+apply() {
+    need_tools
+    echo "DTB: $DTB"
+    if node_in_dtb; then
+        echo "DTB already has $NODE_NAME (live: $(node_live && echo yes || echo 'no - reboot pending'))"
+        return 0
+    fi
+    dtc -I dtb -O dts -o "$TMP/in.dts" "$DTB" 2>/dev/null || { echo "ERROR: dtc decompile failed" >&2; exit 1; }
+    # Insert the regulator node just before charger@1000 inside pmic@2 (PMI8998).
+    awk '
+    /charger@1000 \{/ && !done {
+      print "\t\t\t\tusb_vbus: usb-vbus-regulator@1100 {";
+      print "\t\t\t\t\tcompatible = \"qcom,pm8150b-vbus-reg\";";
+      print "\t\t\t\t\treg = <0x1100>;";
+      print "\t\t\t\t\tregulator-min-microamp = <500000>;";
+      print "\t\t\t\t\tregulator-max-microamp = <3000000>;";
+      print "\t\t\t\t\tregulator-always-on;";
+      print "\t\t\t\t\tregulator-boot-on;";
+      print "\t\t\t\t};";
+      print "";
+      done=1;
+    }
+    {print}
+    ' "$TMP/in.dts" > "$TMP/out.dts"
+    if ! grep -q "$NODE_NAME" "$TMP/out.dts"; then
+        echo "ERROR: charger@1000 anchor not found in DTS; aborting (DTB unchanged)" >&2; exit 1
+    fi
+    dtc -I dts -O dtb -o "$TMP/out.dtb" "$TMP/out.dts" 2>"$TMP/dtc.err" || {
+        echo "ERROR: dtc recompile failed (DTB unchanged):" >&2; cat "$TMP/dtc.err" >&2; exit 1; }
+    backup
+    cp "$TMP/out.dtb" "$DTB"
+    echo "inserted $NODE_NAME into $DTB"
+    flash "${1:-}"
+}
+
+revert() {
+    need_tools
+    echo "DTB: $DTB"
+    if ! node_in_dtb; then
+        echo "node not present in DTB; nothing to revert"; return 0
+    fi
+    dtc -I dtb -O dts -o "$TMP/in.dts" "$DTB" 2>/dev/null || { echo "ERROR: dtc decompile failed" >&2; exit 1; }
+    # Drop the node block (from its opening line to its closing brace; no subnodes).
+    awk '
+    /usb-vbus-regulator@1100 \{/ {skip=1}
+    skip && /};/ {skip=0; next}
+    skip {next}
+    {print}
+    ' "$TMP/in.dts" > "$TMP/out.dts"
+    dtc -I dts -O dtb -o "$TMP/out.dtb" "$TMP/out.dts" 2>"$TMP/dtc.err" || {
+        echo "ERROR: dtc recompile failed (DTB unchanged):" >&2; cat "$TMP/dtc.err" >&2; exit 1; }
+    backup
+    cp "$TMP/out.dtb" "$DTB"
+    echo "removed $NODE_NAME from $DTB"
+    flash "${1:-}"
+}
+
+status() {
+    echo "DTB               : $DTB"
+    echo "DTB node present  : $(node_in_dtb && echo yes || echo no)"
+    echo "live DT node      : $(node_live && echo yes || echo no)"
+    reg=$(grep -l usb_vbus /sys/class/regulator/*/name 2>/dev/null | head -1)
+    if [ -n "$reg" ]; then
+        d=$(dirname "$reg")
+        echo "regulator         : $(basename "$d") name=$(cat "$reg") state=$(cat "$d/state" 2>/dev/null)"
+    else
+        echo "regulator         : (not registered)"
+    fi
+    echo "dwc3 dr_mode      : $(tr -d '\0' < /proc/device-tree/soc@0/usb@a6f8800/usb@a600000/dr_mode 2>/dev/null)"
+    echo "downstream USB    :"
+    if command -v lsusb >/dev/null 2>&1; then lsusb | sed 's/^/  /'; else echo "  (lsusb unavailable; apk add usbutils)"; fi
+}
+
+case "${1:-apply}" in
+    apply)  apply  "${2:-}" ;;
+    revert) revert "${2:-}" ;;
+    status) status ;;
+    *) echo "usage: poco-vbus {apply|revert|status} [--reboot]" >&2; exit 2 ;;
+esac

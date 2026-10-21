@@ -1,0 +1,142 @@
+#!/bin/sh
+# poco-usb - switch the dwc3 USB controller of a Xiaomi POCO F1 (beryllium)
+# running postmarketOS between host and device (peripheral) roles.
+#
+# dwc3-qcom on this kernel does NOT support runtime role switching, so the role
+# is set in the device tree (dr_mode of /soc@0/usb@a6f8800/usb@a600000) and
+# applied by repacking/flashing boot.img (mkinitfs) and rebooting.
+#
+#   host    : USB host (xHCI). KILLS the USB-network lifeline (172.16.42.1) -
+#             make sure Wi-Fi + SSH work before switching.
+#             Pair with `poco-vbus apply` so the phone also powers the device.
+#   device  : USB peripheral - restores the postmarketOS USB-network lifeline
+#             (172.16.42.1), set up by the initramfs at boot.
+#   status  : show live and device-tree-configured role.
+#
+#   poco-usb {host|device|status} [--reboot]
+#
+# A switch requires a reboot. A linux-postmarketos-qcom-sdm845 update reinstalls
+# a pristine DTB (dr_mode=peripheral) - re-run `poco-usb host` afterwards.
+# The DTB is auto-detected (Tianma/EBBG); override with POCO_DTB=/path/to.dtb.
+set -u
+
+# --- DTB auto-detection (shared by poco-usb and poco-vbus) -------------------
+# The POCO F1 ships with either a Tianma or an EBBG panel; postmarketOS boots
+# the matching appended DTB. Resolution order:
+#   1. $POCO_DTB if set (explicit override, full path)
+#   2. /proc/device-tree/model  ("... (Tianma)" / "... (EBBG)")
+#   3. deviceinfo_dtb in /usr/share/deviceinfo/deviceinfo or /etc/deviceinfo,
+#      if it names exactly one variant
+#   4. whichever of the two DTB files exists, if only one does
+DTB_DIR=/boot/dtbs/qcom
+DTB_BASE=sdm845-xiaomi-beryllium
+
+detect_dtb() {
+    if [ -n "${POCO_DTB:-}" ]; then echo "$POCO_DTB"; return 0; fi
+    model=$(tr -d '\0' < /proc/device-tree/model 2>/dev/null | tr 'A-Z' 'a-z')
+    case "$model" in
+        *tianma*) echo "$DTB_DIR/$DTB_BASE-tianma.dtb"; return 0 ;;
+        *ebbg*)   echo "$DTB_DIR/$DTB_BASE-ebbg.dtb";   return 0 ;;
+    esac
+    for f in /usr/share/deviceinfo/deviceinfo /etc/deviceinfo; do
+        [ -r "$f" ] || continue
+        di=$(sed -n 's/^deviceinfo_dtb="\(.*\)"/\1/p' "$f" | tr 'A-Z' 'a-z')
+        case "$di" in
+            *tianma*ebbg*|*ebbg*tianma*) ;;
+            *tianma*) echo "$DTB_DIR/$DTB_BASE-tianma.dtb"; return 0 ;;
+            *ebbg*)   echo "$DTB_DIR/$DTB_BASE-ebbg.dtb";   return 0 ;;
+        esac
+    done
+    found=""; n=0
+    for v in tianma ebbg; do
+        [ -f "$DTB_DIR/$DTB_BASE-$v.dtb" ] && { found="$DTB_DIR/$DTB_BASE-$v.dtb"; n=$((n+1)); }
+    done
+    [ "$n" -eq 1 ] && { echo "$found"; return 0; }
+    return 1
+}
+
+DTB=$(detect_dtb) || {
+    echo "ERROR: cannot determine the active DTB (Tianma vs EBBG)." >&2
+    echo "       Set it explicitly, e.g.:  POCO_DTB=$DTB_DIR/$DTB_BASE-tianma.dtb $0 ..." >&2
+    exit 1
+}
+[ -f "$DTB" ] || { echo "ERROR: DTB not found: $DTB" >&2; exit 1; }
+
+do_reboot() {
+    sync
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        systemctl --no-block reboot
+    else
+        reboot
+    fi
+}
+# -----------------------------------------------------------------------------
+
+NODE=/soc@0/usb@a6f8800/usb@a600000
+LIVE=/proc/device-tree/soc@0/usb@a6f8800/usb@a600000/dr_mode
+BK_BASE=/root/boot-backup
+
+live_mode() { tr -d '\0' < "$LIVE" 2>/dev/null; }
+dtb_mode()  { fdtget "$DTB" "$NODE" dr_mode 2>/dev/null; }
+
+usage() { echo "usage: poco-usb {host|device|status} [--reboot]" >&2; exit 2; }
+
+need_tools() {
+    for t in fdtget fdtput mkinitfs; do
+        command -v "$t" >/dev/null 2>&1 || { echo "ERROR: $t missing (apk add dtc)" >&2; exit 1; }
+    done
+    [ "$(id -u)" -eq 0 ] || { echo "ERROR: run as root (sudo)" >&2; exit 1; }
+}
+
+backup() {
+    bk="$BK_BASE/usb-$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$bk"
+    [ -f /boot/boot.img ] && cp -a /boot/boot.img "$bk/boot.img.pre-usb"
+    cp -a "$DTB" "$bk/$(basename "$DTB").pre-usb"
+    echo "backup: $bk"
+}
+
+apply() { # $1 = host|peripheral  $2 = --reboot?
+    need_tools
+    cur="$(dtb_mode)"
+    echo "DTB: $DTB"
+    if [ "$cur" = "$1" ]; then
+        echo "device tree already dr_mode=$1 (live=$(live_mode))"
+    else
+        backup
+        echo "patching device tree dr_mode: ${cur:-unset} -> $1"
+        fdtput -t s "$DTB" "$NODE" dr_mode "$1" || { echo "ERROR: fdtput failed" >&2; exit 1; }
+        echo "verify: $(dtb_mode)"
+        echo "rebuilding + flashing boot.img ..."
+        mkinitfs >/dev/null 2>&1 || mkinitfs || { echo "ERROR: mkinitfs failed" >&2; exit 1; }
+    fi
+    if [ "$(live_mode)" = "$1" ]; then
+        echo "live role already $1; no reboot needed"
+    elif [ "${2:-}" = "--reboot" ]; then
+        echo "rebooting now (role takes effect on next boot)..."
+        do_reboot
+    else
+        echo "NOTE: reboot required to apply the new role:  sudo reboot"
+        echo "      (or re-run with --reboot)"
+    fi
+}
+
+case "${1:-}" in
+    host)    apply host       "${2:-}" ;;
+    device)  apply peripheral "${2:-}" ;;
+    status)
+        echo "DTB                : $DTB"
+        echo "live dr_mode       : $(live_mode)"
+        echo "device-tree dr_mode: $(dtb_mode)"
+        if [ -e /sys/bus/usb/devices/usb1 ]; then
+            echo "USB role (live)    : HOST (xHCI active)"
+            echo "downstream devices :"
+            ls /sys/bus/usb/devices/ | grep -E '^[0-9]+-[0-9]' | sed 's/^/  /' || echo "  (none connected)"
+        elif [ -n "$(ls /sys/class/udc 2>/dev/null)" ]; then
+            echo "USB role (live)    : DEVICE (gadget / USB-network lifeline)"
+        else
+            echo "USB role (live)    : (no xHCI, no UDC)"
+        fi
+        ;;
+    *) usage ;;
+esac
