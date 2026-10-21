@@ -24,20 +24,16 @@ set -u
 # The POCO F1 ships with either a Tianma or an EBBG panel; postmarketOS boots
 # the matching appended DTB. Resolution order:
 #   1. $POCO_DTB if set (explicit override, full path)
-#   2. /proc/device-tree/model  ("... (Tianma)" / "... (EBBG)")
-#   3. deviceinfo_dtb in /usr/share/deviceinfo/deviceinfo or /etc/deviceinfo,
-#      if it names exactly one variant
+#   2. deviceinfo_dtb in /usr/share/deviceinfo/deviceinfo or /etc/deviceinfo,
+#      if it names exactly one variant (this is what mkinitfs will boot next,
+#      so it wins over the currently running DTB right after a variant switch)
+#   3. /proc/device-tree/model  ("... (Tianma)" / "... (EBBG)")
 #   4. whichever of the two DTB files exists, if only one does
 DTB_DIR=/boot/dtbs/qcom
 DTB_BASE=sdm845-xiaomi-beryllium
 
 detect_dtb() {
     if [ -n "${POCO_DTB:-}" ]; then echo "$POCO_DTB"; return 0; fi
-    model=$(tr -d '\0' < /proc/device-tree/model 2>/dev/null | tr 'A-Z' 'a-z')
-    case "$model" in
-        *tianma*) echo "$DTB_DIR/$DTB_BASE-tianma.dtb"; return 0 ;;
-        *ebbg*)   echo "$DTB_DIR/$DTB_BASE-ebbg.dtb";   return 0 ;;
-    esac
     for f in /usr/share/deviceinfo/deviceinfo /etc/deviceinfo; do
         [ -r "$f" ] || continue
         di=$(sed -n 's/^deviceinfo_dtb="\(.*\)"/\1/p' "$f" | tr 'A-Z' 'a-z')
@@ -47,6 +43,11 @@ detect_dtb() {
             *ebbg*)   echo "$DTB_DIR/$DTB_BASE-ebbg.dtb";   return 0 ;;
         esac
     done
+    model=$(tr -d '\0' < /proc/device-tree/model 2>/dev/null | tr 'A-Z' 'a-z')
+    case "$model" in
+        *tianma*) echo "$DTB_DIR/$DTB_BASE-tianma.dtb"; return 0 ;;
+        *ebbg*)   echo "$DTB_DIR/$DTB_BASE-ebbg.dtb";   return 0 ;;
+    esac
     found=""; n=0
     for v in tianma ebbg; do
         [ -f "$DTB_DIR/$DTB_BASE-$v.dtb" ] && { found="$DTB_DIR/$DTB_BASE-$v.dtb"; n=$((n+1)); }

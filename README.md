@@ -75,9 +75,10 @@ Tested on 2026-06-05: a USB pendrive enumerated at high speed (4 MB read at
 Both scripts pick the DTB in this order:
 
 1. `POCO_DTB` environment variable, if set (full path, explicit override)
-2. `/proc/device-tree/model`: contains `Tianma` or `EBBG`
-3. `deviceinfo_dtb` in `/usr/share/deviceinfo/deviceinfo` (or `/etc/deviceinfo`),
-   if it names exactly one variant
+2. `deviceinfo_dtb` in `/usr/share/deviceinfo/deviceinfo` (or `/etc/deviceinfo`),
+   if it names exactly one variant. This is the DTB `mkinitfs` packs next, so it
+   is right even just after switching kernel variants, before the reboot.
+3. `/proc/device-tree/model`: contains `Tianma` or `EBBG` (the running DTB)
 4. whichever of the two DTB files exists, if only one does
 
 If none of these settles it, the scripts stop without changing anything. Both
@@ -149,6 +150,19 @@ lsusb && ls /dev/sd* /dev/ttyACM* /dev/ttyUSB* 2>/dev/null           # plugged d
 - **Tianma vs EBBG.** The DTB that gets patched must be the one your panel
   actually boots. Auto-detection handles the usual cases; if in doubt, check
   `cat /proc/device-tree/model` and set `POCO_DTB` explicitly.
+- **Replacement screens can lie.** The bootloader's `msm_drm.dsi_display0=`
+  label in `/proc/cmdline` reflects the original panel, not what is fitted now.
+  One unit with a replacement screen was labelled `tianma_fhd_nt36672a` but
+  carried an EBBG-type panel with a FocalTech FT8719 chip: under the Tianma
+  kernel it showed vertical lines and smudging and the Novatek touch driver
+  failed with `Error reading from 0x78: -5`. Quick check from a shell
+  (`apk add i2c-tools`): `i2cget -y 14 0x38 0x00` answering means FT8719
+  (EBBG variant), while a Novatek answers at `0x01`. Switch with
+  `apk add device-xiaomi-beryllium-kernel-ebbg` (or `-tianma`), then re-run
+  both scripts and reboot.
+- **Touch I2C bus.** The touchscreen controller (`a98000.i2c`, bus 14) runs in
+  GPI DMA mode only; its FIFO path is disabled by firmware. Removing its `dmas`
+  properties makes the bus disappear, so don't.
 - **VBUS is always on.** The phone sources 5 V permanently, even with nothing
   plugged in, which costs some battery. Do not connect the phone to another host
   (PC, charger acting as a source) while the VBUS node is active and the port is
